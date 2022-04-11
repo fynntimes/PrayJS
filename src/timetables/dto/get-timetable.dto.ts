@@ -1,9 +1,9 @@
 export class SimpleDate {
   /** the Gregorian year */
   year: number;
-  /** the Gregorian month */
+  /** the Gregorian month, where 1 is January */
   month: number;
-  /** the Gregorian day */
+  /** the Gregorian day, where 1 is the first day of the month */
   day: number;
 }
 

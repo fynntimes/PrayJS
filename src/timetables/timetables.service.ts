@@ -1,7 +1,12 @@
-import { BadRequestException, Injectable } from '@nestjs/common';
-import { GetTimetableDto } from './dto/get-timetable.dto';
-
+import {
+  BadRequestException,
+  CACHE_MANAGER,
+  Inject,
+  Injectable,
+} from '@nestjs/common';
+import { Cache } from 'cache-manager';
 import PrayTimes from '../praytimes.js';
+import { GetTimetableDto } from './dto/get-timetable.dto';
 import {
   Timetable,
   TimetableDay,
@@ -12,10 +17,34 @@ import {
 const lastDayOfMonth = (year: number, month: number) =>
   new Date(year, month, 0).getDate();
 
+const asTimetableDay = (day: number, times: any) => {
+  const ttd = new TimetableDay();
+  ttd.day = day;
+  ttd.imsak = times.imsak;
+  ttd.fajr = times.fajr;
+  ttd.sunrise = times.sunrise;
+  ttd.dhuhr = times.dhuhr;
+  ttd.asr = times.asr;
+  ttd.maghrib = times.maghrib;
+  ttd.isha = times.isha;
+  ttd.midnight = times.midnight;
+  return ttd;
+};
+
+const getCacheKey = (data: GetTimetableDto) => JSON.stringify(data);
+
+const validateAndSanitize = (val: string, valids: Array<string>) => {
+  for (let i = 0; i < valids.length; i++) {
+    if (val.toLowerCase() === valids[i].toLowerCase()) {
+      return valids[i];
+    }
+  }
+  throw new BadRequestException(`format must be one of ${valids.join(',')}`);
+};
 @Injectable()
 export class TimetablesService {
   private readonly prayTimes = PrayTimes();
-  private validMethods = [
+  private readonly validMethods = [
     'MWL',
     'ISNA',
     'Egypt',
@@ -24,14 +53,15 @@ export class TimetablesService {
     'Tehran',
     'Jafari',
   ];
-  private validOutputFormats = ['24h', '12h', '12hNS', 'Float'];
+  private readonly validOutputFormats = ['24h', '12h', '12hNS', 'Float'];
 
-  generate(data: GetTimetableDto) {
+  constructor(@Inject(CACHE_MANAGER) private cacheManager: Cache) {}
+
+  async generate(data: GetTimetableDto) {
     const start = data.startDate;
     const end = data.endDate ?? data.startDate;
     const coords = [data.latitude, data.longitude];
-    const { timezone, format = '12h', method = 'Jafari' } = data;
-    const dst = 0;
+    const timezone = data.timezone;
 
     if (
       !data.startDate ||
@@ -44,21 +74,25 @@ export class TimetablesService {
       );
     }
 
-    if (this.validOutputFormats.indexOf(format) === -1) {
-      throw new BadRequestException(
-        `format must be one of ${this.validOutputFormats.join(',')}`,
-      );
-    }
+    const format = data.format
+      ? validateAndSanitize(data.format, this.validOutputFormats)
+      : '12h';
 
-    if (this.validMethods.indexOf(method) === -1) {
-      throw new BadRequestException(
-        `method must be one of ${this.validMethods.join(',')}`,
-      );
-    }
+    const method = data.method
+      ? validateAndSanitize(data.method, this.validMethods)
+      : 'Jafari';
 
     this.prayTimes.setMethod(method);
 
+    const cachedValue = await this.cacheManager.get(getCacheKey(data));
+    if (cachedValue) {
+      return cachedValue;
+    }
+
     const result = new Timetable();
+
+    // Loops over every year-month-day combination from the start date
+    // to the end date.
     for (let year = start.year; year <= end.year; year++) {
       const resYear = new TimetableYear(year);
 
@@ -76,27 +110,15 @@ export class TimetablesService {
             : lastDayOfMonth(+year, +month);
 
         for (let day = dayLB; day <= dayUB; day++) {
-          const resDay = new TimetableDay();
-          resDay.day = day;
-          console.log([year, month, day], coords, timezone, dst, format);
+          // Here we finally have the year-month-day, so we generate times
           const times = this.prayTimes.getTimes(
             [+year, +month, +day],
             coords,
             timezone,
-            dst,
+            0, // dst always false, let timezone encode DST status
             format,
           );
-          console.log(times);
-          resDay.imsak = times.imsak;
-          resDay.fajr = times.fajr;
-          resDay.sunrise = times.sunrise;
-          resDay.dhuhr = times.dhuhr;
-          resDay.asr = times.asr;
-          resDay.maghrib = times.maghrib;
-          resDay.isha = times.isha;
-          resDay.midnight = times.midnight;
-
-          resMonth.days.push(resDay);
+          resMonth.days.push(asTimetableDay(day, times));
         }
 
         resYear.months.push(resMonth);
@@ -105,6 +127,8 @@ export class TimetablesService {
       result.years.push(resYear);
     }
 
+    // use the day, month, year properties of timetable objects
+    // as keys in the resultant API output.
     const formattedResult: any = {};
     result.years.forEach((y) => {
       const formattedYear = {};
@@ -116,6 +140,10 @@ export class TimetablesService {
       formattedResult[y.year] = formattedYear;
     });
 
+    // cache this result so that we don't have to redo all this computation.
+    // setting TTL to 0 ensures it never expires, since every input always returns
+    // the same result.
+    this.cacheManager.set(getCacheKey(data), formattedResult, { ttl: 0 });
     return formattedResult;
   }
 }
